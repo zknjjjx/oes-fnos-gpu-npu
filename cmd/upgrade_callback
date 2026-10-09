@@ -1,0 +1,9 @@
+#!/bin/bash
+BIN="${TRIM_APPDEST}/bin/oes-gpu-npu"
+mkdir -p "${TRIM_PKGVAR}"
+bash "$BIN" install > "${TRIM_PKGVAR}/install.log" 2>&1 || true
+ln -sf "$BIN" /usr/local/bin/oes-gpu-npu 2>/dev/null
+MODE="${wizard_npu:-$(cat /etc/oes-gpu-npu/npu-mode 2>/dev/null || echo khadas)}"
+VMODE="${wizard_vdec:-$(cat /etc/oes-gpu-npu/vdec-mode 2>/dev/null || echo on)}"
+nohup bash -c "bash '$BIN' npu-on-mode '$MODE' > '${TRIM_PKGVAR}/npu.log' 2>&1; bash '$BIN' vdec-mode '$VMODE' > '${TRIM_PKGVAR}/vdec.log' 2>&1" >/dev/null 2>&1 &
+exit 0
