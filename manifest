@@ -1,0 +1,13 @@
+appname      = oes-gpu-npu
+version      = 1.1.2
+display_name = OES GPU/NPU/硬解 驱动启用
+desc         = 为网心云 OES（Amlogic A311D）启用 Mali-G52 GPU 与 Vivante NPU。内置移植到飞牛 6.18 内核的 galcore 6.4.8.7 驱动（自带预编译、开机自动替换）和配套 OpenVX/ovxlib 6.4.8 库，可直接运行 .nb 模型。另含 H.264 视频硬解（Amlogic VDEC，ffmpeg -c:v h264_v4l2m2m）。SSH 下：oes-gpu-npu status / npu-test / vdec-test。
+platform     = arm
+source       = thirdparty
+maintainer   = Kenong Zhao
+distributor  = Kenong Zhao
+install_type = root
+ctl_stop     = false
+checkport    = false
+disable_authorization_path = true
+changelog    = 1.1.2：修复 NPU 空闲时在资源监控中显示 15~30% 占用的问题（galcore 负载统计采样窗口为零）。1.1.1：自带飞牛内核 6.18.18.c1151-trim 的预编译 galcore 与硬解模块，安装几秒即可启用，无需 gcc；内核不匹配时自动回退本机编译。1.1.0：新增 H.264 视频硬件解码。补齐飞牛内核缺失的 codec-io/寄存器表/canvas/时钟初始化，修复 MPLANE 输出格式与 vdec 时钟计数不平衡（vdec 固定 fclk_div3），与软解逐帧 md5 一致，CPU 占用约为软解的 1%。新增 vdec-on/vdec-off/vdec-test。1.0.4：NPU 可用（移植 galcore 6.4.8.7）。
