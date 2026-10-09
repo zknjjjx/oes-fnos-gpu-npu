@@ -1,0 +1,4 @@
+#!/bin/bash
+BIN="${TRIM_APPDEST}/bin/oes-gpu-npu"
+[ -f "$BIN" ] && bash "$BIN" uninstall >/tmp/oes-gpu-npu-uninstall.log 2>&1
+exit 0
