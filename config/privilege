@@ -1,0 +1,7 @@
+{
+    "defaults": {
+        "run-as": "root"
+    },
+    "username": "oes-gpu-npu",
+    "groupname": "oes-gpu-npu"
+}
