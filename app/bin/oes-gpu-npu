@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  网心云 OES (Amlogic A311D) · 飞牛 fnOS ARM
+#  GPU (Mali-G52 / panfrost) + NPU (Vivante VIPNano / etnaviv + Teflon) 启用脚本
+#
+#  用法 (root):
+#    bash oes-a311d-gpu-npu.sh install          # 检测 + 启用 GPU/NPU（默认）
+#    bash oes-a311d-gpu-npu.sh install --teflon # 额外从源码编译 NPU 用户态 libteflon.so（约 30~60 分钟）
+#    bash oes-a311d-gpu-npu.sh status           # 只看状态，不做修改
+#    bash oes-a311d-gpu-npu.sh uninstall        # 还原 dtb、删除配置
+#
+#  原理:
+#    1) 内核需带 CONFIG_DRM_PANFROST 与 CONFIG_DRM_ETNAVIV（飞牛 6.18 内核已带；6.12 视构建而定）
+#    2) 设备树里 gpu / npu 节点需为 status="okay"，否则用 fdtput 改当前 dtb（自动备份）
+#    3) 开机自动加载 panfrost / etnaviv，/dev/dri 给 render 组和容器可读写
+#    4) GPU 用户态: Mesa (panfrost)；NPU 用户态: Mesa Teflon (TFLite delegate)
+#  说明: 不执行 apt upgrade，避免破坏飞牛系统包。
+# =====================================================================
+set -euo pipefail
+
+STATE_DIR=/etc/oes-gpu-npu
+MODLOAD=/etc/modules-load.d/oes-gpu-npu.conf
+UDEV_RULE=/etc/udev/rules.d/99-oes-gpu-npu.rules
+TEFLON_PREFIX=/opt/teflon
+MESA_TAG="${MESA_TAG:-mesa-25.1.0}"
+
+c_g='\033[32m'; c_y='\033[33m'; c_r='\033[31m'; c_0='\033[0m'
+ok()   { echo -e "${c_g}[OK]${c_0} $*"; }
+warn() { echo -e "${c_y}[!!]${c_0} $*"; }
+die()  { echo -e "${c_r}[XX]${c_0} $*"; [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$*" > "$TRIM_TEMP_LOGFILE"; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo -i 后再执行"; }
+
+# ---------- 1. 硬件 / 内核检测 ----------
+check_soc() {
+  local compat
+  compat=$(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null || true)
+  echo "设备树 compatible: $compat"
+  if echo "$compat" | grep -qiE 'a311d|g12b'; then ok "识别为 Amlogic A311D/G12B"
+  else warn "未识别为 A311D，继续执行可能无效"; fi
+  echo "内核: $(uname -r)"
+}
+
+export PATH="$PATH:/sbin:/usr/sbin"
+KV=$(uname -r)
+has_module() {
+  [ -d "/sys/module/$1" ] && return 0
+  modinfo "$1" >/dev/null 2>&1 && return 0
+  grep -qE "/$1\.ko" "/lib/modules/$KV/modules.builtin" 2>/dev/null && return 0
+  [ -n "$(find "/lib/modules/$KV" -name "$1.ko*" 2>/dev/null | head -n1)" ]
+}
+GPU_DRV=""; NPU_DRV=""
+detect_drivers() {
+  for m in mali_kbase mali bifrost_kbase panfrost; do has_module "$m" && { GPU_DRV=$m; break; }; done
+  for m in etnaviv galcore; do has_module "$m" && { NPU_DRV=$m; break; }; done
+}
+
+check_kernel() {
+  detect_drivers
+  [ -n "$GPU_DRV" ] && ok "GPU 驱动: $GPU_DRV" || warn "内核没有 GPU 驱动 (panfrost / mali_kbase)"
+  [ -n "$NPU_DRV" ] && ok "NPU 驱动: $NPU_DRV" || warn "内核没有 NPU 驱动 (etnaviv / galcore)"
+  if [ -z "$GPU_DRV" ] && [ -z "$NPU_DRV" ]; then
+    warn "GPU 和 NPU 驱动都没有，当前内核 $KV 无法启用"; return 1
+  fi
+  return 0
+}
+
+# ---------- 2. 设备树 ----------
+# 按 compatible 找节点，输出 dtb 内的节点路径
+find_node() {   # $1 = compatible 正则
+  local f
+  while IFS= read -r -d '' f; do
+    if tr '\0' '\n' < "$f" | grep -qiE "$1"; then
+      dirname "${f#/proc/device-tree}"; return 0
+    fi
+  done < <(find /proc/device-tree -name compatible -print0 2>/dev/null)
+  return 1
+}
+
+node_status() { # $1 = 节点路径
+  local s="/proc/device-tree$1/status"
+  [ -f "$s" ] && tr -d '\0' < "$s" || echo "okay"
+}
+
+current_dtb() {
+  local f p
+  for f in /boot/uEnv.txt /boot/armbianEnv.txt /boot/extlinux/extlinux.conf; do
+    [ -f "$f" ] || continue
+    p=$(grep -E '^\s*(FDT|fdt|fdtfile)\s*[= ]' "$f" | head -n1 | sed -E 's/^\s*(FDT|fdt|fdtfile)\s*[= ]\s*//')
+    [ -n "$p" ] || continue
+    for c in "$p" "/boot$p" "/boot/dtb/$p" "/boot/dtb/amlogic/$(basename "$p")"; do
+      [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+  done
+  # 兜底：按名字找 OES 的 dtb
+  find /boot -name '*a311d*oes*.dtb' -o -name '*onethingcloud-oes.dtb' 2>/dev/null | grep -v plus | head -n1
+}
+
+ensure_dt() {
+  GPU_NODE=$(find_node 'arm,mali-bifrost|amlogic,meson-g12a-mali' || true)
+  NPU_NODE=$(find_node 'vivante,gc' || true)
+  [ -n "$GPU_NODE" ] && echo "GPU 节点: $GPU_NODE  status=$(node_status "$GPU_NODE")" || warn "设备树中没有 GPU 节点"
+  [ -n "$NPU_NODE" ] && echo "NPU 节点: $NPU_NODE  status=$(node_status "$NPU_NODE")" || warn "设备树中没有 NPU 节点（需 6.8+ 内核对应的 dtb）"
+
+  local todo=()
+  [ -n "$GPU_NODE" ] && [ "$(node_status "$GPU_NODE")" != "okay" ] && todo+=("$GPU_NODE")
+  [ -n "$NPU_NODE" ] && [ "$(node_status "$NPU_NODE")" != "okay" ] && todo+=("$NPU_NODE")
+  if [ ${#todo[@]} -eq 0 ]; then ok "设备树无需修改"; return 0; fi
+
+  local dtb; dtb=$(current_dtb || true)
+  [ -n "$dtb" ] && [ -f "$dtb" ] || die "找不到当前使用的 dtb，请手动确认 /boot 下的 FDT 配置"
+  echo "当前 dtb: $dtb"
+  command -v fdtput >/dev/null || apt-get install -y --no-install-recommends device-tree-compiler
+  mkdir -p "$STATE_DIR"
+  [ -f "$STATE_DIR/dtb.bak" ] || { cp -a "$dtb" "$STATE_DIR/dtb.bak"; echo "$dtb" > "$STATE_DIR/dtb.path"; ok "已备份 dtb"; }
+  for n in "${todo[@]}"; do
+    fdtput -t s "$dtb" "$n" status okay && ok "已启用节点 $n"
+  done
+  NEED_REBOOT=1
+}
+
+# ---------- 3. 驱动加载 / 权限 ----------
+ensure_modules() {
+  : > "$MODLOAD"
+  for m in $GPU_DRV $NPU_DRV; do
+    echo "$m" >> "$MODLOAD"
+    modprobe "$m" 2>/dev/null && ok "$m 已加载" || warn "$m 暂未加载（改过 dtb 需重启）"
+  done
+}
+
+ensure_perms() {
+  getent group render >/dev/null || groupadd -r render
+  cat > "$UDEV_RULE" <<'EOF'
+# OES A311D: 让 render 组和 docker 容器可访问 GPU/NPU
+SUBSYSTEM=="drm", KERNEL=="renderD*", GROUP="render", MODE="0666"
+SUBSYSTEM=="drm", KERNEL=="card*",    GROUP="video",  MODE="0660"
+# 厂商驱动: mali_kbase -> /dev/mali0, galcore -> /dev/galcore
+KERNEL=="mali[0-9]*", GROUP="render", MODE="0666"
+KERNEL=="galcore",    GROUP="render", MODE="0666"
+EOF
+  chmod 666 /dev/mali0 /dev/galcore 2>/dev/null || true
+  udevadm control --reload-rules && udevadm trigger --subsystem-match=drm || true
+  ok "已写入 udev 规则"
+}
+
+# ---------- 4. 用户态 ----------
+ensure_mesa() {
+  if [ "$GPU_DRV" != "panfrost" ] && [ "$NPU_DRV" != "etnaviv" ]; then
+    ok "使用厂商驱动 ($GPU_DRV / $NPU_DRV)，无需安装 Mesa"; return 0
+  fi
+  apt-get update -qq || warn "apt update 失败，跳过 Mesa 安装"
+  apt-get install -y --no-install-recommends libgl1-mesa-dri libegl1 libgles2 mesa-utils \
+    && ok "Mesa (panfrost) 用户态已安装" || warn "Mesa 安装失败"
+  if apt-cache show mesa-teflon-delegate >/dev/null 2>&1; then
+    apt-get install -y --no-install-recommends mesa-teflon-delegate && ok "已从软件源安装 Teflon (NPU delegate)"
+    TEFLON_OK=1
+  fi
+}
+
+build_teflon() {
+  [ "${TEFLON_OK:-0}" = 1 ] && return 0
+  if [ "$NPU_DRV" != "etnaviv" ]; then
+    warn "NPU 使用的是厂商 galcore 驱动，Teflon 只支持 etnaviv，跳过编译"; return 0
+  fi
+  warn "从源码编译 Mesa Teflon ($MESA_TAG)，安装到 $TEFLON_PREFIX，不影响系统 Mesa"
+  apt-get install -y --no-install-recommends git build-essential pkg-config python3-venv python3-mako \
+    python3-yaml python3-pycparser bison flex libexpat1-dev zlib1g-dev libudev-dev
+  local src=/usr/local/src/mesa venv=/usr/local/src/mesa-venv
+  [ -d "$venv" ] || python3 -m venv "$venv"
+  "$venv/bin/pip" install -q 'meson>=1.4' ninja mako pyyaml
+  [ -d "$src" ] || git clone --depth 1 -b "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git "$src"
+  cd "$src"
+  PATH="$venv/bin:$PATH" meson setup build --wipe --prefix="$TEFLON_PREFIX" --buildtype=release \
+    -Dgallium-drivers=etnaviv -Dvulkan-drivers= -Dteflon=true -Dllvm=disabled \
+    -Dglx=disabled -Dplatforms= -Dgbm=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
+    --force-fallback-for=libdrm
+  PATH="$venv/bin:$PATH" ninja -C build install
+  local so; so=$(find "$TEFLON_PREFIX" -name libteflon.so | head -n1)
+  [ -n "$so" ] && { ok "Teflon 已编译：$so"; echo "$so" > "$STATE_DIR/teflon.path"; } || warn "未找到 libteflon.so，编译可能失败"
+}
+
+# ---------- 5. 状态 ----------
+status() {
+  echo "------ DRM 设备 ------"
+  for d in /sys/class/drm/renderD* /sys/class/drm/card[0-9]; do
+    [ -e "$d/device/driver" ] || continue
+    echo "  /dev/dri/$(basename "$d")  ->  $(basename "$(readlink -f "$d/device/driver")")"
+  done
+  for n in /dev/mali0 /dev/galcore; do [ -e "$n" ] && echo "  $(ls -l $n)"; done
+  lsmod | grep -E '^(panfrost|etnaviv|mali|galcore)' || echo "  GPU/NPU 驱动未加载"
+  echo "------ 内核日志 ------"
+  dmesg 2>/dev/null | grep -iE 'panfrost|etnaviv|galcore|gpu identified|probed as' | tail -n 8 || true
+  [ -f "$STATE_DIR/teflon.path" ] && echo "Teflon: $(cat "$STATE_DIR/teflon.path")"
+  ls /usr/lib/*/libteflon.so 2>/dev/null || true
+}
+
+uninstall() {
+  rm -f "$MODLOAD" "$UDEV_RULE"
+  if [ -f "$STATE_DIR/dtb.bak" ]; then
+    cp -a "$STATE_DIR/dtb.bak" "$(cat "$STATE_DIR/dtb.path")" && ok "已还原 dtb"
+  fi
+  rm -rf "$STATE_DIR" "$TEFLON_PREFIX"
+  ok "已卸载，重启后生效"
+}
+
+
+# ---------- NPU：移植版 galcore 6.4.8.7 + Vivante 6.4.8 用户态 ----------
+APPBASE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# 开机服务运行的是 /etc/oes-gpu-npu 下的副本，从记录中找回应用目录
+[ -d "$APPBASE/npu/src" ] || APPBASE="$(cat /etc/oes-gpu-npu/appbase 2>/dev/null || echo "$APPBASE")"
+KO="$STATE_DIR/galcore-6.4.8.ko"
+NPU_MODE_FILE="$STATE_DIR/npu-mode"
+SWAP_PENDING="$STATE_DIR/swap.pending"
+LOADED_FLAG=/run/oes-galcore648.loaded
+SVC=/etc/systemd/system/oes-galcore648.service
+
+# 预编译驱动：app/prebuilt/<内核版本>/，vermagic 一致时直接使用，免编译
+PREBUILT="$APPBASE/prebuilt/$KV"
+pb_ok() { [ -f "$PREBUILT/$1" ] && modinfo -F vermagic "$PREBUILT/$1" 2>/dev/null | grep -q "^$KV "; }
+npu_mode() { cat "$NPU_MODE_FILE" 2>/dev/null || echo stock; }
+ours_loaded() { [ -f "$LOADED_FLAG" ] && [ -d /sys/module/galcore ]; }
+ko_ok() { [ -f "$KO" ] && modinfo -F vermagic "$KO" 2>/dev/null | grep -q "^$KV "; }
+
+npu_build() {
+  local kdir="/lib/modules/$KV/build" b=/var/tmp/oes-galcore648-build
+  if pb_ok galcore-6.4.8.ko; then
+    mkdir -p "$STATE_DIR"; cp -f "$PREBUILT/galcore-6.4.8.ko" "$KO"; ok "使用预编译 galcore（内核 $KV）"; return 0
+  fi
+  [ -d "$kdir" ] || { warn "缺少内核头文件 $kdir，无法编译移植版驱动"; return 1; }
+  command -v gcc >/dev/null && command -v make >/dev/null || { warn "缺少 gcc/make（apt install gcc make）"; return 1; }
+  echo "编译 galcore 6.4.8.7（内核 $KV，约 1~3 分钟）..."
+  rm -rf "$b"; mkdir -p "$b" "$STATE_DIR"; cp -a "$APPBASE/npu/src/." "$b/"
+  if make -C "$kdir" M="$b" -j"$(nproc)" modules > "$STATE_DIR/build.log" 2>&1 && [ -f "$b/galcore.ko" ]; then
+    cp "$b/galcore.ko" "$KO"; rm -rf "$b"; ok "驱动编译完成"; return 0
+  fi
+  warn "编译失败："; grep -E 'error|ERROR' "$STATE_DIR/build.log" | head -10; return 1
+}
+
+npu_on() {   # $1 = --boot 时为开机自动执行
+  [ "$(npu_mode)" = khadas ] || { echo "NPU 模式为飞牛原版，不切换"; return 0; }
+  [ -e /proc/device-tree ] || return 0
+  if [ "${1:-}" = --boot ] && [ -f "$SWAP_PENDING" ]; then
+    rm -f "$SWAP_PENDING"; echo stock > "$NPU_MODE_FILE"
+    warn "上次切换驱动时设备异常重启，已自动改回飞牛原版驱动"; return 0
+  fi
+  ours_loaded && { ok "移植版 galcore 已在运行"; return 0; }
+  if ! ko_ok; then
+    if [ "${1:-}" = --boot ]; then   # 内核升级后：等应用卷挂载再重新编译
+      local w; for w in $(seq 1 60); do [ -d "$APPBASE/npu/src" ] && break; sleep 2; done
+    fi
+    npu_build || { warn "没有可用的移植版驱动，保持原版"; return 1; }
+  fi
+  if [ -d /sys/module/galcore ]; then
+    local i refs
+    for i in $(seq 1 30); do
+      refs=$(cat /sys/module/galcore/refcnt 2>/dev/null || echo 0)
+      [ "$refs" = 0 ] && break; sleep 2
+    done
+    [ "$refs" = 0 ] || { warn "原版 galcore 正被占用 (refcnt=$refs)，请关闭相册的人脸/智能识别后执行：oes-gpu-npu npu-on"; return 1; }
+  fi
+  touch "$SWAP_PENDING"; sync
+  if [ -d /sys/module/galcore ]; then rmmod galcore || { rm -f "$SWAP_PENDING"; warn "卸载原版 galcore 失败"; return 1; }; fi
+  if insmod "$KO" powerManagement=0; then
+    rm -f "$SWAP_PENDING"; touch "$LOADED_FLAG"; sleep 1
+    chmod 666 /dev/galcore 2>/dev/null || true
+    ok "已切换到移植版 galcore 6.4.8.7"
+  else
+    rm -f "$SWAP_PENDING"; warn "加载移植版失败，恢复原版"; modprobe galcore || true; return 1
+  fi
+}
+
+npu_off() {
+  echo stock > "$NPU_MODE_FILE"
+  systemctl disable oes-galcore648.service >/dev/null 2>&1 || true
+  if ours_loaded; then
+    if timeout 20 rmmod galcore; then rm -f "$LOADED_FLAG"; modprobe galcore && ok "已恢复飞牛原版 galcore"
+    else warn "卸载移植版超时，请重启 NAS 恢复原版"; fi
+  else ok "已设为飞牛原版驱动"; fi
+}
+
+npu_setup() {  # $1 = khadas | stock
+  mkdir -p "$STATE_DIR"
+  [ "$NPU_DRV" = galcore ] || { warn "NPU 不是 galcore 驱动，跳过移植版"; return 0; }
+  if [ "${1:-stock}" != khadas ]; then npu_off; return 0; fi
+  echo khadas > "$NPU_MODE_FILE"
+  cp -f "$APPBASE/bin/oes-gpu-npu" "$STATE_DIR/oes-gpu-npu"   # 开机时应用卷可能尚未挂载
+  echo "$APPBASE" > "$STATE_DIR/appbase"
+  cat > "$SVC" <<EOF
+[Unit]
+Description=OES NPU: swap stock galcore for ported galcore 6.4.8.7
+After=systemd-modules-load.service local-fs.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $STATE_DIR/oes-gpu-npu npu-on --boot
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload; systemctl enable oes-galcore648.service >/dev/null 2>&1 || true
+  # 预编译驱动更新时（如 1.1.2 修复负载显示）替换旧副本，重启后生效
+  if pb_ok galcore-6.4.8.ko && ! cmp -s "$PREBUILT/galcore-6.4.8.ko" "$KO"; then rm -f "$KO"; fi
+  ko_ok || npu_build || { warn "编译失败，暂时保持原版驱动（日志 $STATE_DIR/build.log）"; return 0; }
+  npu_on || true
+}
+
+npu_remove() {
+  systemctl disable oes-galcore648.service >/dev/null 2>&1 || true
+  rm -f "$SVC"; systemctl daemon-reload 2>/dev/null || true
+  ours_loaded && warn "移植版驱动仍在运行，重启后恢复飞牛原版"
+}
+
+npu_test() {
+  local d="$APPBASE/npu/incv3" out rc=0 top idx
+  [ -e /dev/galcore ] || die "/dev/galcore 不存在，NPU 驱动未加载"
+  echo "驱动: $(ours_loaded && echo '移植版 galcore 6.4.8.7' || echo '飞牛原版 galcore（与自带 6.4.8 库不匹配，预计失败）')"
+  echo "测试: InceptionV3 识别金鱼图片"
+  out=$(cd "$d" && LD_LIBRARY_PATH="$APPBASE/npu/lib:$d" timeout 120 ./inceptionv3 inception_v3.nb goldfish_299x299.jpg 2>&1) || rc=$?
+  echo "$out" | grep -E 'Run the 1 time' || true
+  echo "$out" | sed -n '/Top5/,$p' | grep -E '^ *[0-9]+: ' | while read -r idx p; do
+    idx=${idx%:}; echo "  $(sed -n "$((idx+1))p" "$d/imagenet_slim_labels.txt")  $p"
+  done
+  top=$(echo "$out" | sed -n '/Top5/,$p' | grep -m1 -oE '^ *[0-9]+:' | tr -d ' :')
+  if [ "$rc" = 0 ] && [ "$top" = 2 ]; then ok "NPU 推理正常"; return 0; fi
+  warn "NPU 推理失败 (rc=$rc)"; echo "$out" | tail -8
+  dmesg 2>/dev/null | grep -iE 'galcore' | tail -5; return 1
+}
+
+npu_status() {
+  echo "------ NPU ------"
+  echo "  模式: $( [ "$(npu_mode)" = khadas ] && echo '移植版 6.4.8.7' || echo '飞牛原版')"
+  echo "  当前: $(ours_loaded && echo '移植版 galcore 6.4.8.7 运行中' || { [ -d /sys/module/galcore ] && echo '飞牛原版 galcore' || echo '未加载'; })"
+  ko_ok && echo "  驱动文件: $KO" || echo "  驱动文件: 未编译/与内核不匹配"
+}
+
+# ---------- 视频硬解：Amlogic VDEC (h264_v4l2m2m) ----------
+VDIR="$STATE_DIR/vdec"
+VMODS="oes_clkfix oes_codec_io oes_reg_ops oes_canvas oes_vdec_alias oes_v4l2fix"
+VDEC_MODE_FILE="$STATE_DIR/vdec-mode"
+VDEC_PENDING="$STATE_DIR/vdec.pending"
+VSVC=/etc/systemd/system/oes-vdec.service
+VFLAG=/run/oes-vdec.loaded
+FF=/usr/trim/lib/mediasrv/ffmpeg
+
+vdec_mode() { cat "$VDEC_MODE_FILE" 2>/dev/null || echo off; }
+vko_ok() {
+  local m
+  for m in $VMODS; do
+    [ -f "$VDIR/$m.ko" ] && modinfo -F vermagic "$VDIR/$m.ko" 2>/dev/null | grep -q "^$KV " || return 1
+  done
+}
+ksym() { awk -v s="$1" -v m="[$2]" '$3==s && $4==m{print "0x"$1; exit}' /proc/kallsyms; }
+
+vdec_build() {
+  local kdir="/lib/modules/$KV/build" b=/var/tmp/oes-vdec-build m
+  local pall=1
+  for m in $VMODS; do pb_ok "$m.ko" || pall=0; done
+  if [ "$pall" = 1 ]; then
+    mkdir -p "$VDIR"; for m in $VMODS; do cp -f "$PREBUILT/$m.ko" "$VDIR/"; done
+    ok "使用预编译硬解模块（内核 $KV）"; return 0
+  fi
+  [ -d "$kdir" ] || { warn "缺少内核头文件 $kdir"; return 1; }
+  command -v gcc >/dev/null && command -v make >/dev/null || { warn "缺少 gcc/make"; return 1; }
+  echo "编译视频硬解补丁模块（内核 $KV）..."
+  rm -rf "$b"; mkdir -p "$b" "$VDIR"; cp -a "$APPBASE/vdec/src/." "$b/"
+  if make -C "$kdir" M="$b" KBUILD_MODPOST_WARN=1 modules > "$VDIR/build.log" 2>&1; then
+    for m in $VMODS; do
+      [ -f "$b/$m.ko" ] || { warn "缺少 $m.ko"; return 1; }
+      cp "$b/$m.ko" "$VDIR/"
+    done
+    rm -rf "$b"; ok "硬解模块编译完成"; return 0
+  fi
+  warn "编译失败："; grep -E 'error' "$VDIR/build.log" | head -10; return 1
+}
+
+vins() { [ -d "/sys/module/$1" ] && return 0; insmod "$VDIR/$1.ko" "${@:2}"; }
+
+vdec_load() {
+  local reg md ops m
+  [ -d /sys/module/oes_v4l2fix ] && [ -f "$VFLAG" ] && { ok "视频硬解已启用"; return 0; }
+  # 1. 先把 vdec 时钟固定到 fclk_div3（必须在任何解码之前）
+  vins oes_clkfix || { warn "oes_clkfix（时钟修正）加载失败，为安全起见不启用硬解"; return 1; }
+  modprobe registers || return 1
+  md=$(ksym codecio_meson_dev registers); reg=$(ksym codecio_reg_start registers)
+  [ -n "$md" ] && [ -n "$reg" ] || { warn "kallsyms 中找不到 registers 符号"; return 1; }
+  vins oes_codec_io meson_dev="$md" reg_start="$reg" || return 1
+  vins oes_reg_ops meson_dev="$md" || return 1
+  modprobe amlogic_media_compat_provider 2>/dev/null || true
+  vins oes_canvas || return 1
+  for m in amvdec_mh264_v4l amvdec_h265_v4l amvdec_vp9_v4l; do modprobe "$m" 2>/dev/null || true; done
+  vins oes_vdec_alias || return 1
+  chmod 644 /lib/firmware/video/video_ucode.bin 2>/dev/null || true
+  echo 1 > /sys/class/firmware_codec/reload 2>/dev/null || true
+  modprobe amvdec_ports || return 1
+  echo Y > /sys/module/amvdec_ports/parameters/multiplanar
+  ops=$(ksym aml_vdec_ioctl_ops amvdec_ports)
+  [ -n "$ops" ] || { warn "kallsyms 中找不到 aml_vdec_ioctl_ops"; return 1; }
+  vins oes_v4l2fix ops="$ops" || return 1
+  touch "$VFLAG"; ok "视频硬解已启用（ffmpeg -c:v h264_v4l2m2m）"
+}
+
+vdec_on() {   # $1 = --boot 时为开机自动执行
+  [ "$(vdec_mode)" = on ] || { echo "视频硬解未开启"; return 0; }
+  if [ "${1:-}" = --boot ] && [ -f "$VDEC_PENDING" ]; then
+    rm -f "$VDEC_PENDING"; echo off > "$VDEC_MODE_FILE"
+    warn "上次加载硬解模块时设备异常重启，已自动关闭视频硬解"; return 0
+  fi
+  if ! vko_ok; then
+    if [ "${1:-}" = --boot ]; then
+      local w; for w in $(seq 1 60); do [ -d "$APPBASE/vdec/src" ] && break; sleep 2; done
+    fi
+    vdec_build || { warn "没有可用的硬解模块"; return 1; }
+  fi
+  touch "$VDEC_PENDING"; sync
+  if vdec_load; then rm -f "$VDEC_PENDING"; return 0; fi
+  rm -f "$VDEC_PENDING"; warn "硬解启用失败，重启后恢复原状"; return 1
+}
+
+vdec_setup() {  # $1 = on | off
+  mkdir -p "$STATE_DIR"
+  [ -e /proc/device-tree ] || return 0
+  [ -n "$(find /lib/modules/$KV -name 'amvdec_ports.ko*' 2>/dev/null | head -n1)" ] || { warn "内核没有 amvdec_ports，跳过视频硬解"; return 0; }
+  if [ "${1:-off}" != on ]; then vdec_off; return 0; fi
+  echo on > "$VDEC_MODE_FILE"
+  cp -f "$APPBASE/bin/oes-gpu-npu" "$STATE_DIR/oes-gpu-npu"   # 开机时应用卷可能尚未挂载
+  echo "$APPBASE" > "$STATE_DIR/appbase"
+  cat > "$VSVC" <<VEOF
+[Unit]
+Description=OES VDEC: enable Amlogic hardware video decode (v4l2m2m)
+After=systemd-modules-load.service local-fs.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $STATE_DIR/oes-gpu-npu vdec-on --boot
+[Install]
+WantedBy=multi-user.target
+VEOF
+  systemctl daemon-reload; systemctl enable oes-vdec.service >/dev/null 2>&1 || true
+  vko_ok || vdec_build || { warn "编译失败（日志 $VDIR/build.log）"; return 0; }
+  vdec_on || true
+}
+
+vdec_off() {
+  echo off > "$VDEC_MODE_FILE"
+  systemctl disable oes-vdec.service >/dev/null 2>&1 || true
+  if [ -f "$VFLAG" ]; then warn "硬解模块仍在运行，重启后完全关闭"; else ok "视频硬解已关闭"; fi
+}
+
+vdec_remove() {
+  systemctl disable oes-vdec.service >/dev/null 2>&1 || true
+  rm -f "$VSVC"; systemctl daemon-reload 2>/dev/null || true
+}
+
+vdec_test() {   # $1 = 帧数（默认 10）
+  local t=/var/tmp/oes-vdec-test n="${1:-10}" d
+  mkdir -p "$t"
+  [ -f "$VFLAG" ] || die "视频硬解未启用（先执行 oes-gpu-npu vdec-on）"
+  [ -f "$t/t.mp4" ] || "$FF" -nostdin -loglevel error -y -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 5 -c:v libx264 -pix_fmt yuv420p "$t/t.mp4" || die "生成测试视频失败"
+  "$FF" -nostdin -loglevel error -y -i "$t/t.mp4" -frames:v "$n" -pix_fmt yuv420p -f framemd5 "$t/sw.md5"
+  timeout -s KILL 60 "$FF" -nostdin -loglevel error -y -c:v h264_v4l2m2m -i "$t/t.mp4" -frames:v "$n" -vf crop=1920:1080:0:0 -pix_fmt yuv420p -f framemd5 "$t/hw.md5" 2>&1 | grep -v deprecated | tail -3 || true
+  echo "硬解帧数: $(grep -vc '^#' "$t/hw.md5" 2>/dev/null || echo 0)"
+  d=$(diff <(grep -v '^#' "$t/sw.md5" | awk -F, '{print $6}') <(grep -v '^#' "$t/hw.md5" | awk -F, '{print $6}') >/dev/null && echo same || echo diff)
+  if [ "$d" = same ]; then ok "H.264 硬解正常，与软解逐帧一致"; else warn "硬解结果与软解不一致"; return 1; fi
+}
+
+vdec_status() {
+  echo "------ 视频硬解 ------"
+  echo "  模式: $( [ "$(vdec_mode)" = on ] && echo 开启 || echo 关闭)"
+  echo "  当前: $( [ -f "$VFLAG" ] && echo '已启用（h264_v4l2m2m）' || echo 未启用)"
+  mount | grep -q debugfs || mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+  if [ -r /sys/kernel/debug/clk/vdec_1_sel/clk_parent ]; then
+    echo "  vdec 时钟: $(cat /sys/kernel/debug/clk/vdec_1_sel/clk_parent) $(cat /sys/kernel/debug/clk/vdec_1_sel/clk_rate)"
+  fi
+}
+
+# ---------- main ----------
+need_root
+case "${1:-install}" in
+  status)    check_soc; check_kernel || true; status; npu_status; vdec_status ;;
+  diag)      check_soc; detect_drivers; echo "GPU=$GPU_DRV NPU=$NPU_DRV"; ls /lib/modules/$KV/kernel/drivers/gpu/drm 2>/dev/null; status ;;
+  npu-test)  npu_test ;;
+  npu-on)    detect_drivers; if [ "${2:-}" = --boot ]; then npu_on --boot; else npu_setup khadas; fi ;;
+  npu-off)   npu_off ;;
+  npu-on-mode) detect_drivers; npu_setup "${2:-khadas}"; npu_status ;;
+  npu-build) detect_drivers; npu_build ;;
+  vdec-on)   if [ "${2:-}" = --boot ]; then vdec_on --boot; else vdec_setup on; vdec_status; fi ;;
+  vdec-off)  vdec_off ;;
+  vdec-mode) vdec_setup "${2:-on}"; vdec_status ;;
+  vdec-build) vdec_build ;;
+  vdec-test) vdec_test "${2:-10}" ;;
+  uninstall) npu_remove; vdec_remove; uninstall ;;
+  install)
+    NEED_REBOOT=0
+    check_soc
+    check_kernel || die "内核不支持，已停止（未做任何修改）"
+    ensure_dt
+    ensure_modules
+    ensure_perms
+    ensure_mesa
+    [ "${2:-}" = "--teflon" ] && build_teflon
+    status
+    echo
+    [ "$NEED_REBOOT" = 1 ] && warn "已修改设备树，请 reboot 后再执行：bash $0 status"
+    if [ -e /dev/galcore ] || [ -e /dev/mali0 ]; then
+      ok "完成。Docker 容器使用时加参数：--device /dev/mali0 --device /dev/galcore"
+    else
+      ok "完成。Docker 容器使用 NPU/GPU 时加参数：--device /dev/dri"
+    fi
+    ;;
+  *) echo "用法: $0 {install [--teflon]|status|diag|npu-test|npu-on|npu-off|npu-build|vdec-on|vdec-off|vdec-test|uninstall}"; exit 1 ;;
+esac
