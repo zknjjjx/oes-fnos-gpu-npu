@@ -1,0 +1,43 @@
+[
+  {
+    "stepTitle": "启用 GPU / NPU",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "仅适用于网心云 OES（A311D，飞牛 6.18 内核）。“移植版 NPU 驱动”自带针对飞牛内核 6.18.18.c1151 预编译的 galcore 6.4.8.7（其他内核版本会在后台用本机内核头文件自动编译），并在每次开机时替换飞牛原版驱动，使应用自带的 OpenVX/ovxlib 库和 .nb 模型能在 NPU 上运行（实测 InceptionV3 约 20 毫秒）。切换后飞牛相册的人脸/智能识别可能无法使用 NPU；卸载本应用并重启即可恢复原版。安装后可在 SSH 执行 oes-gpu-npu status 和 oes-gpu-npu npu-test。 视频硬解：启用 Amlogic VDEC，让 ffmpeg 可用 -c:v h264_v4l2m2m 做 H.264 硬件解码（CPU 占用约降到软解的 1%）。自带预编译的 6 个补丁模块，开机自动加载；如加载过程中设备异常重启，会自动关闭。可用 oes-gpu-npu vdec-test 自检。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_npu",
+        "label": "NPU 驱动",
+        "initValue": "khadas",
+        "options": [
+          {
+            "label": "移植版 6.4.8.7（可跑 OpenVX / .nb 模型）",
+            "value": "khadas"
+          },
+          {
+            "label": "保持飞牛原版（相册 AI 用）",
+            "value": "stock"
+          }
+        ]
+      },
+      {
+        "type": "radio",
+        "field": "wizard_vdec",
+        "label": "视频硬解（H.264，实验性）",
+        "initValue": "on",
+        "options": [
+          {
+            "label": "开启",
+            "value": "on"
+          },
+          {
+            "label": "关闭",
+            "value": "off"
+          }
+        ]
+      }
+    ]
+  }
+]
