@@ -1,0 +1,15 @@
+#!/bin/bash
+BIN="${TRIM_APPDEST}/bin/oes-gpu-npu"
+LOG="${TRIM_PKGVAR}/install.log"
+mkdir -p "${TRIM_PKGVAR}"
+bash "$BIN" install > "$LOG" 2>&1 || {
+  [ -s "$TRIM_TEMP_LOGFILE" ] || echo "启用失败，详见 $LOG" > "$TRIM_TEMP_LOGFILE"
+  exit 1
+}
+ln -sf "$BIN" /usr/local/bin/oes-gpu-npu 2>/dev/null
+# NPU 驱动模式：khadas = 移植版 6.4.8.7（后台编译并切换），stock = 飞牛原版
+MODE="${wizard_npu:-khadas}"
+# 视频硬解：on = 编译并开机自动启用 h264_v4l2m2m，off = 不启用
+VMODE="${wizard_vdec:-on}"
+nohup bash -c "bash '$BIN' npu-on-mode '$MODE' > '${TRIM_PKGVAR}/npu.log' 2>&1; bash '$BIN' vdec-mode '$VMODE' > '${TRIM_PKGVAR}/vdec.log' 2>&1" >/dev/null 2>&1 &
+exit 0
